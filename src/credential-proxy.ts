@@ -79,11 +79,12 @@ export function startCredentialProxy(
           }
         }
 
+        const path = upstreamUrl.pathname.replace(/\/+$/, '') + req.url;
         const upstream = makeRequest(
           {
             hostname: upstreamUrl.hostname,
             port: upstreamUrl.port || (isHttps ? 443 : 80),
-            path: req.url,
+            path: path,
             method: req.method,
             headers,
           } as RequestOptions,
@@ -94,10 +95,7 @@ export function startCredentialProxy(
         );
 
         upstream.on('error', (err) => {
-          logger.error(
-            { err, url: req.url },
-            'Credential proxy upstream error',
-          );
+          logger.error({ err, url: path }, 'Credential proxy upstream error');
           if (!res.headersSent) {
             res.writeHead(502);
             res.end('Bad Gateway');
