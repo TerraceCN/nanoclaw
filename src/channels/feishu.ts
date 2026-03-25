@@ -32,7 +32,8 @@ interface FeishuTableElement {
 type FeishuElement =
   | FeishuTableElement
   | { tag: 'markdown'; content: string }
-  | { tag: 'div'; text: { tag: 'lark_md'; content: string } };
+  | { tag: 'div'; text: { tag: 'lark_md'; content: string } }
+  | { tag: 'hr' };
 
 type MessageFormat = 'text' | 'post' | 'interactive';
 
@@ -288,8 +289,6 @@ export class FeishuChannel implements Channel {
   private static readonly _TABLE_RE =
     /((?:^[ \t]*\|.+\|[ \t]*\n)(?:^[ \t]*\|[-:\s|]+\|[ \t]*\n)(?:^[ \t]*\|.+\|[ \t]*\n?)+)/gmu;
 
-  private static readonly _HEADING_RE = /^(#{1,6})\s+(.+)$/gmu;
-
   private static readonly _CODE_BLOCK_RE = /(```[\s\S]*?```)/gmu;
 
   // Markdown formatting patterns that should be stripped from plain-text
@@ -311,6 +310,7 @@ export class FeishuChannel implements Channel {
     return line
       .trim()
       .split('|')
+      .filter((c) => c.trim())
       .map((c) => c.trim());
   }
 
@@ -410,20 +410,31 @@ export class FeishuChannel implements Channel {
     const elements: FeishuElement[] = [];
     let lastEnd = 0;
 
-    for (const m of protected_.matchAll(FeishuChannel._HEADING_RE)) {
+    // Match both headings and horizontal rules
+    const combinedRe = /^(#{1,6})\s+(.+)$|^[\s]*-{3,}[\s]*$/gmu;
+
+    for (const m of protected_.matchAll(combinedRe)) {
       const before = protected_.slice(lastEnd, m.index).trim();
       if (before) {
         elements.push({ tag: 'markdown', content: before });
       }
-      const text = FeishuChannel._stripMdFormatting(m[2].trim());
-      const displayText = text ? `**${text}**` : '';
-      elements.push({
-        tag: 'div',
-        text: {
-          tag: 'lark_md',
-          content: displayText,
-        },
-      });
+
+      if (m[1] !== undefined) {
+        // Heading match
+        const text = FeishuChannel._stripMdFormatting(m[2].trim());
+        const displayText = text ? `**${text}**` : '';
+        elements.push({
+          tag: 'div',
+          text: {
+            tag: 'lark_md',
+            content: displayText,
+          },
+        });
+      } else {
+        // Horizontal rule match
+        elements.push({ tag: 'hr' });
+      }
+
       lastEnd = m.index! + m[0].length;
     }
 
