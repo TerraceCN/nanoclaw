@@ -8,7 +8,7 @@ import os from 'os';
 import { logger } from './logger.js';
 
 /** The container runtime binary name. */
-export const CONTAINER_RUNTIME_BIN = 'container';
+export const CONTAINER_RUNTIME_BIN = 'docker';
 
 /** CLI args needed for the container to resolve the host gateway. */
 export function hostGatewayArgs(): string[] {
@@ -20,8 +20,14 @@ export function hostGatewayArgs(): string[] {
 }
 
 /** Returns CLI args for a readonly bind mount. */
-export function readonlyMountArgs(hostPath: string, containerPath: string): string[] {
-  return ['--mount', `type=bind,source=${hostPath},target=${containerPath},readonly`];
+export function readonlyMountArgs(
+  hostPath: string,
+  containerPath: string,
+): string[] {
+  return [
+    '--mount',
+    `type=bind,source=${hostPath},target=${containerPath},readonly`,
+  ];
 }
 
 /** Returns the shell command to stop a container by name. */
@@ -69,21 +75,30 @@ export function ensureContainerRuntimeRunning(): void {
 /** Kill orphaned NanoClaw containers from previous runs. */
 export function cleanupOrphans(): void {
   try {
-    const output = execSync(`${CONTAINER_RUNTIME_BIN} ls --format json`, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      encoding: 'utf-8',
-    });
-    const containers: { status: string; configuration: { id: string } }[] = JSON.parse(output || '[]');
+    const output = execSync(
+      `${CONTAINER_RUNTIME_BIN} ps --format json --filter "name=nanoclaw-"`,
+      {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        encoding: 'utf-8',
+      },
+    );
+    const containers: { names: string[] }[] = JSON.parse(output || '[]');
     const orphans = containers
-      .filter((c) => c.status === 'running' && c.configuration.id.startsWith('nanoclaw-'))
-      .map((c) => c.configuration.id);
+      .flatMap((c) => c.names)
+      .map((name) => name.replace(/^\//, ''))
+      .filter((name) => name.startsWith('nanoclaw-'));
     for (const name of orphans) {
       try {
         execSync(stopContainer(name), { stdio: 'pipe' });
-      } catch { /* already stopped */ }
+      } catch {
+        /* already stopped */
+      }
     }
     if (orphans.length > 0) {
-      logger.info({ count: orphans.length, names: orphans }, 'Stopped orphaned containers');
+      logger.info(
+        { count: orphans.length, names: orphans },
+        'Stopped orphaned containers',
+      );
     }
   } catch (err) {
     logger.warn({ err }, 'Failed to clean up orphaned containers');
