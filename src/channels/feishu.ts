@@ -11,6 +11,31 @@ import {
   RegisteredGroup,
 } from '../types.js';
 
+interface FeishuTableColumn {
+  tag: 'column';
+  name: string;
+  display_name: string;
+  width: string;
+}
+
+interface FeishuTableRow {
+  [key: string]: string;
+}
+
+interface FeishuTableElement {
+  tag: 'table';
+  page_size: number;
+  columns: FeishuTableColumn[];
+  rows: FeishuTableRow[];
+}
+
+type FeishuElement =
+  | FeishuTableElement
+  | { tag: 'markdown'; content: string }
+  | { tag: 'div'; text: { tag: 'lark_md'; content: string } };
+
+type MessageFormat = 'text' | 'post' | 'interactive';
+
 export interface FeishuChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
@@ -43,7 +68,7 @@ export class FeishuChannel implements Channel {
 
     this.wsClient = new Lark.WSClient({
       ...baseConfig,
-      loggerLevel: Lark.LoggerLevel.debug,
+      loggerLevel: Lark.LoggerLevel.warn,
     });
 
     this.wsClient.start({
@@ -179,7 +204,7 @@ export class FeishuChannel implements Channel {
         } else if (item.tag === 'code_block') {
           content = '```' + (item.language || '') + '\n' + item.text + '\n```';
         } else if (item.tag === 'hr') {
-          content = '-----';
+          content = '---';
         } else {
           continue;
         }
@@ -199,28 +224,44 @@ export class FeishuChannel implements Channel {
 
     try {
       const chatId = jid.replace(/^fs:/, '');
+      const format = FeishuChannel._detectMsgFormat(text);
 
-      // Split long messages (Feishu limit is 4000 chars for text)
-      const MAX_LENGTH = 4000;
-      const messages =
-        text.length > MAX_LENGTH ? [text.slice(0, MAX_LENGTH)] : [text];
-
-      for (const message of messages) {
-        await this.client.im.v1.message.create({
-          params: {
-            receive_id_type: 'chat_id',
-          },
-          data: {
-            receive_id: chatId,
-            content: JSON.stringify({ text: message }),
-            msg_type: 'text',
-          },
-        });
+      switch (format) {
+        case 'text':
+          await this._sendText(chatId, text);
+          break;
+        case 'post':
+          await this._sendPost(chatId, text);
+          break;
+        case 'interactive':
+          await this._sendCard(chatId, this._buildCardElements(text));
+          break;
       }
 
-      logger.info({ jid, length: text.length }, 'Feishu message sent');
+      logger.info({ jid, length: text.length, format }, 'Feishu message sent');
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Feishu message');
+    }
+  }
+
+  private async _sendText(chatId: string, text: string): Promise<void> {
+    // Split long messages (Feishu limit is 4000 chars for text)
+    const MAX_LENGTH = 4000;
+    const messages =
+      text.length > MAX_LENGTH ? [text.slice(0, MAX_LENGTH)] : [text];
+
+    for (const message of messages) {
+      logger.debug({ text: message }, 'send feishu text message');
+      await this.client!.im.v1.message.create({
+        params: {
+          receive_id_type: 'chat_id',
+        },
+        data: {
+          receive_id: chatId,
+          content: JSON.stringify({ text: message }),
+          msg_type: 'text',
+        },
+      });
     }
   }
 
@@ -240,6 +281,322 @@ export class FeishuChannel implements Channel {
 
   async setTyping(jid: string, isTyping: boolean): Promise<void> {
     // Feishu doesn't support typing indicators via API
+  }
+
+  // ── Markdown parsing and formatting ──────────────────────────────────
+
+  private static readonly _TABLE_RE =
+    /((?:^[ \t]*\|.+\|[ \t]*\n)(?:^[ \t]*\|[-:\s|]+\|[ \t]*\n)(?:^[ \t]*\|.+\|[ \t]*\n?)+)/gmu;
+
+  private static readonly _HEADING_RE = /^(#{1,6})\s+(.+)$/gmu;
+
+  private static readonly _CODE_BLOCK_RE = /(```[\s\S]*?```)/gmu;
+
+  // Markdown formatting patterns that should be stripped from plain-text
+  // surfaces like table cells and heading text.
+  private static readonly _MD_BOLD_RE = /\*\*(.+?)\*\*/;
+  private static readonly _MD_BOLD_UNDERSCORE_RE = /__(.+?)__/;
+  private static readonly _MD_ITALIC_RE = /(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/;
+  private static readonly _MD_STRIKE_RE = /~~(.+?)~~/;
+
+  private static _stripMdFormatting(text: string): string {
+    text = text.replace(this._MD_BOLD_RE, '$1');
+    text = text.replace(this._MD_BOLD_UNDERSCORE_RE, '$1');
+    text = text.replace(this._MD_ITALIC_RE, '$1');
+    text = text.replace(this._MD_STRIKE_RE, '$1');
+    return text;
+  }
+
+  private static _split(line: string): string[] {
+    return line
+      .trim()
+      .split('|')
+      .map((c) => c.trim());
+  }
+
+  private static _parseMdTable(tableText: string): FeishuTableElement | null {
+    const lines = tableText
+      .trim()
+      .split('\n')
+      .filter((line) => line.trim());
+    if (lines.length < 3) return null;
+
+    const headers = this._split(lines[0]).map((h) =>
+      this._stripMdFormatting(h),
+    );
+    const rows = lines
+      .slice(2)
+      .map((line) => this._split(line).map((c) => this._stripMdFormatting(c)));
+
+    const columns: FeishuTableColumn[] = headers.map((h, i) => ({
+      tag: 'column',
+      name: `c${i}`,
+      display_name: h,
+      width: 'auto',
+    }));
+
+    return {
+      tag: 'table',
+      page_size: rows.length + 1,
+      columns,
+      rows: rows.map((r) =>
+        Object.fromEntries(headers.map((_, i) => [`c${i}`, r[i] ?? ''])),
+      ),
+    };
+  }
+
+  private _buildCardElements(content: string): FeishuElement[] {
+    const elements: FeishuElement[] = [];
+    let lastEnd = 0;
+
+    for (const m of content.matchAll(FeishuChannel._TABLE_RE)) {
+      const before = content.slice(lastEnd, m.index);
+      if (before.trim()) {
+        elements.push(...this._splitHeadings(before));
+      }
+      const parsed = FeishuChannel._parseMdTable(m[1]);
+      elements.push(parsed ?? { tag: 'markdown', content: m[1] });
+      lastEnd = m.index! + m[0].length;
+    }
+
+    const remaining = content.slice(lastEnd);
+    if (remaining.trim()) {
+      elements.push(...this._splitHeadings(remaining));
+    }
+
+    return elements.length ? elements : [{ tag: 'markdown', content }];
+  }
+
+  private static _splitElementsByTableLimit(
+    elements: FeishuElement[],
+    maxTables = 1,
+  ): FeishuElement[][] {
+    if (!elements.length) return [[]];
+
+    const groups: FeishuElement[][] = [];
+    let current: FeishuElement[] = [];
+    let tableCount = 0;
+
+    for (const el of elements) {
+      if ('tag' in el && el.tag === 'table') {
+        if (tableCount >= maxTables) {
+          if (current.length) groups.push(current);
+          current = [];
+          tableCount = 0;
+        }
+        current.push(el);
+        tableCount++;
+      } else {
+        current.push(el);
+      }
+    }
+
+    if (current.length) groups.push(current);
+    return groups.length ? groups : [[]];
+  }
+
+  private _splitHeadings(content: string): FeishuElement[] {
+    // Protect code blocks
+    const codeBlocks: string[] = [];
+    let protected_ = content;
+    for (const m of protected_.matchAll(FeishuChannel._CODE_BLOCK_RE)) {
+      codeBlocks.push(m[1]);
+      protected_ = protected_.replace(
+        m[1],
+        `\x00CODE${codeBlocks.length - 1}\x00`,
+      );
+    }
+
+    const elements: FeishuElement[] = [];
+    let lastEnd = 0;
+
+    for (const m of protected_.matchAll(FeishuChannel._HEADING_RE)) {
+      const before = protected_.slice(lastEnd, m.index).trim();
+      if (before) {
+        elements.push({ tag: 'markdown', content: before });
+      }
+      const text = FeishuChannel._stripMdFormatting(m[2].trim());
+      const displayText = text ? `**${text}**` : '';
+      elements.push({
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content: displayText,
+        },
+      });
+      lastEnd = m.index! + m[0].length;
+    }
+
+    const remaining = protected_.slice(lastEnd).trim();
+    if (remaining) {
+      elements.push({ tag: 'markdown', content: remaining });
+    }
+
+    // Restore code blocks
+    for (let i = 0; i < codeBlocks.length; i++) {
+      for (const el of elements) {
+        if ('content' in el && typeof el.content === 'string') {
+          el.content = el.content.replace(`\x00CODE${i}\x00`, codeBlocks[i]);
+        }
+      }
+    }
+
+    return elements.length ? elements : [{ tag: 'markdown', content }];
+  }
+
+  // ── Smart format detection ──────────────────────────────────────────
+
+  // Patterns that indicate "complex" markdown needing card rendering
+  private static readonly _COMPLEX_MD_RE =
+    /```|^\|.+\|.*\n\s*\|[-:\s|]+\||^#{1,6}\s+/mu;
+
+  // Simple markdown patterns (bold, italic, strikethrough)
+  private static readonly _SIMPLE_MD_RE =
+    /\*\*.+?\*\*|__.+?__|(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)|~~.+?~~/mu;
+
+  // Markdown link: [text](url)
+  private static readonly _MD_LINK_RE = /\[([^\]]+)\]\((https?:\/\/[^\)]+)\)/g;
+
+  // Unordered list items
+  private static readonly _LIST_RE = /^[\s]*[-*+]\s+/mu;
+
+  // Ordered list items
+  private static readonly _OLIST_RE = /^[\s]*\d+\.\s+/mu;
+
+  // Max length for plain text format
+  private static readonly _TEXT_MAX_LEN = 200;
+
+  // Max length for post (rich text) format; beyond this, use card
+  private static readonly _POST_MAX_LEN = 2000;
+
+  private static _detectMsgFormat(content: string): MessageFormat {
+    const stripped = content.trim();
+
+    // Complex markdown (code blocks, tables, headings) → always card
+    if (this._COMPLEX_MD_RE.test(stripped)) {
+      return 'interactive';
+    }
+
+    // Long content → card (better readability with card layout)
+    if (stripped.length > this._POST_MAX_LEN) {
+      return 'interactive';
+    }
+
+    // Has bold/italic/strikethrough → card (post format can't render these)
+    if (this._SIMPLE_MD_RE.test(stripped)) {
+      return 'interactive';
+    }
+
+    // Has list items → card (post format can't render list bullets well)
+    if (this._LIST_RE.test(stripped) || this._OLIST_RE.test(stripped)) {
+      return 'interactive';
+    }
+
+    // Has links → post format (supports <a> tags)
+    if (this._MD_LINK_RE.test(stripped)) {
+      return 'post';
+    }
+
+    // Short plain text → text format
+    if (stripped.length <= this._TEXT_MAX_LEN) {
+      return 'text';
+    }
+
+    // Medium plain text without any formatting → post format
+    return 'post';
+  }
+
+  private static _markdownToPost(content: string): Record<string, unknown> {
+    const lines = content.trim().split('\n');
+    const paragraphs: Record<string, unknown>[][] = [];
+
+    for (const line of lines) {
+      const els: Record<string, unknown>[] = [];
+      let lastEnd = 0;
+
+      for (const m of line.matchAll(this._MD_LINK_RE)) {
+        const before = line.slice(lastEnd, m.index);
+        if (before) {
+          els.push({ tag: 'text', text: before });
+        }
+        els.push({
+          tag: 'a',
+          text: m[1],
+          href: m[2],
+        });
+        lastEnd = m.index! + m[0].length;
+      }
+
+      const remaining = line.slice(lastEnd);
+      if (remaining) {
+        els.push({ tag: 'text', text: remaining });
+      }
+
+      // Empty line → empty paragraph for spacing
+      if (!els.length) {
+        els.push({ tag: 'text', text: '' });
+      }
+
+      paragraphs.push(els);
+    }
+
+    const postBody = {
+      zh_cn: {
+        content: paragraphs,
+      },
+    };
+    return postBody;
+  }
+
+  private _sendCard(chatId: string, elements: FeishuElement[]): Promise<void> {
+    if (!this.client) {
+      logger.warn('Feishu client not initialized');
+      return Promise.resolve();
+    }
+
+    const elementGroups = FeishuChannel._splitElementsByTableLimit(elements);
+
+    return (async () => {
+      for (const group of elementGroups) {
+        const cardContent = {
+          config: { wide_screen_mode: true },
+          elements: group,
+        };
+        logger.debug({ cardContent }, 'send feishu interactive message');
+        await this.client!.im.v1.message.create({
+          params: {
+            receive_id_type: 'chat_id',
+          },
+          data: {
+            receive_id: chatId,
+            content: JSON.stringify(cardContent),
+            msg_type: 'interactive',
+          },
+        });
+      }
+    })();
+  }
+
+  private _sendPost(chatId: string, content: string): Promise<void> {
+    if (!this.client) {
+      logger.warn('Feishu client not initialized');
+      return Promise.resolve();
+    }
+
+    const postBody = FeishuChannel._markdownToPost(content);
+    logger.debug({ postBody }, 'send feishu post message');
+    return this.client.im.v1.message
+      .create({
+        params: {
+          receive_id_type: 'chat_id',
+        },
+        data: {
+          receive_id: chatId,
+          content: JSON.stringify(postBody),
+          msg_type: 'post',
+        },
+      })
+      .then(() => undefined);
   }
 }
 
